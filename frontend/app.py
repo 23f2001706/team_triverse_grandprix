@@ -569,4 +569,334 @@ def run_full_simulation(
     progress(0, desc="Fetching venue layout...")
     
     layout_data = fetch_venue_layout(venue_type)
-    if "error" in 
+    if "error" in layout_data:
+        error_msg = f"❌ Error fetching layout: {layout_data['error']}"
+        empty_fig = go.Figure()
+        empty_df = pd.DataFrame({"Error": [error_msg]})
+        return (empty_fig, empty_fig, empty_fig, empty_fig, 
+                empty_df, empty_df, error_msg, "")
+    
+    # Build initial map (no simulation data yet)
+    node_map = {n["id"]: n for n in layout_data.get("nodes", [])}
+    
+    progress(0.1, desc="Running crowd simulation (this may take 30-60 seconds)...")
+    
+    result = run_simulation_request(
+        venue_type=venue_type,
+        crowd_size=int(crowd_size),
+        event_duration=int(event_duration),
+        arrival_pattern=arrival_pattern,
+        time_step=int(time_step)
+    )
+    
+    if "error" in result:
+        error_msg = f"❌ Simulation error: {result['error']}"
+        empty_fig = go.Figure()
+        empty_df = pd.DataFrame({"Error": [error_msg]})
+        return (empty_fig, empty_fig, empty_fig, empty_fig,
+                empty_df, empty_df, error_msg, "")
+    
+    progress(0.7, desc="Building visualisations...")
+    
+    # Extract data
+    bottlenecks = result.get("bottlenecks", [])
+    suggestions = result.get("reroute_suggestions", [])
+    risk_score = result.get("risk_score", 0)
+    occupancy_timeline = result.get("node_occupancy_timeline", {})
+    ai_report = result.get("ai_safety_report", "No report generated.")
+    sim_id = result.get("simulation_id", "N/A")
+    peak_step = result.get("peak_congestion_time", 0)
+    peak_minute = (peak_step * time_step) // 60
+    
+    # Peak occupancy snapshot
+    peak_snapshot = {}
+    for node_id, series in occupancy_timeline.items():
+        if series and peak_step < len(series):
+            peak_snapshot[node_id] = series[peak_step]
+    
+    # Build figures
+    venue_map = build_venue_map(
+        layout_data, bottlenecks, suggestions, peak_snapshot
+    )
+    
+    bn_node_ids = [b["node_id"] for b in bottlenecks]
+    occupancy_chart = build_occupancy_chart(
+        occupancy_timeline, node_map, time_step, bn_node_ids
+    )
+    
+    heatmap = build_heatmap(occupancy_timeline, node_map, time_step)
+    risk_gauge = build_risk_gauge(risk_score)
+    
+    # Tables
+    bn_df = format_bottleneck_table(bottlenecks)
+    reroute_df = format_reroute_table(suggestions, node_map)
+    
+    # Summary text
+    summary = (
+        f"✅ **Simulation Complete** | ID: `{sim_id}`\n\n"
+        f"- **Risk Score:** {risk_score}/100\n"
+        f"- **Bottlenecks Found:** {len(bottlenecks)}\n"
+        f"- **Rerouting Suggestions:** {len(suggestions)}\n"
+        f"- **Peak Congestion At:** {peak_minute} minutes into event\n"
+        f"- **Crowd Size:** {crowd_size:,} people | "
+        f"**Duration:** {event_duration} min | "
+        f"**Pattern:** {arrival_pattern}"
+    )
+    
+    progress(1.0, desc="Done!")
+    
+    return (
+        venue_map,
+        occupancy_chart,
+        heatmap,
+        risk_gauge,
+        bn_df,
+        reroute_df,
+        ai_report,
+        summary
+    )
+
+
+def preview_venue(venue_type: str) -> go.Figure:
+    """Show venue layout before simulation."""
+    layout_data = fetch_venue_layout(venue_type)
+    if "error" in layout_data:
+        fig = go.Figure()
+        fig.add_annotation(
+            text=f"Error loading venue: {layout_data['error']}",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16, color="red")
+        )
+        return fig
+    return build_venue_map(layout_data)
+
+
+# ── Gradio Interface ──────────────────────────────────────────────────────────
+
+with gr.Blocks(
+    title="🏟️ Crowd Flow Optimiser",
+    theme=gr.themes.Soft(
+        primary_hue="blue",
+        secondary_hue="orange"
+    ),
+    css="""
+        .risk-critical { background: #ffebee; border-left: 4px solid #f44336; }
+        .risk-high     { background: #fff3e0; border-left: 4px solid #ff9800; }
+        .header-box { 
+            background: linear-gradient(135deg, #1a237e, #283593);
+            color: white; padding: 20px; border-radius: 10px;
+            margin-bottom: 15px;
+        }
+        .metric-box {
+            background: #f5f5f5; border-radius: 8px;
+            padding: 15px; text-align: center;
+        }
+    """
+) as demo:
+    
+    # ── Header ─────────────────────────────────────────────────────────
+    gr.HTML("""
+        <div style="background: linear-gradient(135deg, #1a237e, #1565C0);
+                    color: white; padding: 25px; border-radius: 12px;
+                    margin-bottom: 20px; text-align: center;">
+            <h1 style="margin:0; font-size: 2.2em;">
+                🏟️ Crowd Flow Optimiser
+            </h1>
+            <p style="margin: 8px 0 0 0; font-size: 1.1em; opacity: 0.9;">
+                Simulate crowd movement · Detect bottlenecks · Generate safe rerouting
+            </p>
+            <p style="margin: 5px 0 0 0; font-size: 0.85em; opacity: 0.7;">
+                Powered by Agent-Based Simulation + Mistral-7B on HuggingFace Hub
+            </p>
+        </div>
+    """)
+    
+    # ── Controls ───────────────────────────────────────────────────────
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("### ⚙️ Simulation Settings")
+            
+            venue_selector = gr.Dropdown(
+                choices=["Stadium", "Festival"],
+                value="Stadium",
+                label="🏟️ Venue Type",
+                info="Choose pre-built venue layout"
+            )
+            
+            crowd_size_slider = gr.Slider(
+                minimum=100,
+                maximum=5000,
+                value=1500,
+                step=100,
+                label="👥 Total Crowd Size",
+                info="Number of people attending"
+            )
+            
+            duration_slider = gr.Slider(
+                minimum=30,
+                maximum=300,
+                value=90,
+                step=15,
+                label="⏱️ Event Duration (minutes)"
+            )
+            
+            arrival_pattern = gr.Radio(
+                choices=["Uniform", "Rush", "Staggered"],
+                value="Uniform",
+                label="📊 Arrival Pattern",
+                info=(
+                    "Uniform: spread evenly | "
+                    "Rush: most arrive early | "
+                    "Staggered: waves"
+                )
+            )
+            
+            time_step = gr.Slider(
+                minimum=10,
+                maximum=60,
+                value=30,
+                step=10,
+                label="⏲️ Simulation Time Step (seconds)",
+                info="Smaller = more accurate but slower"
+            )
+            
+            with gr.Row():
+                preview_btn = gr.Button("👁️ Preview Venue", variant="secondary")
+                run_btn = gr.Button(
+                    "▶️ Run Simulation", 
+                    variant="primary",
+                    size="lg"
+                )
+            
+            gr.Markdown("""
+            ---
+            **How it works:**
+            1. Choose your venue and crowd settings
+            2. Click **Preview Venue** to see the layout
+            3. Click **Run Simulation** to start
+            4. View bottlenecks, heatmaps and AI safety report
+            
+            **Legend:**
+            - 🟢 Entry Gates
+            - 🔵 Exits  
+            - ⭐ Emergency Exits
+            - 🟠 Concessions
+            - 🟣 Junctions
+            - 🔴 Critical bottleneck
+            - 🟠 High bottleneck
+            - 🟡 Medium bottleneck
+            - 🟢 Low / Safe zone
+            - **Green lines** = suggested alternate routes
+            - **Red dashed** = congested original routes
+            """)
+        
+        # ── Main Visualisation Area ─────────────────────────────────
+        with gr.Column(scale=3):
+            summary_text = gr.Markdown(
+                "Configure settings and click **Run Simulation** to begin."
+            )
+            
+            with gr.Tabs():
+                with gr.TabItem("🗺️ Venue Map"):
+                    venue_map_plot = gr.Plot(label="Venue Map")
+                
+                with gr.TabItem("📈 Occupancy Over Time"):
+                    occupancy_plot = gr.Plot(label="Occupancy Timeline")
+                
+                with gr.TabItem("🌡️ Congestion Heatmap"):
+                    heatmap_plot = gr.Plot(label="Heatmap")
+                
+                with gr.TabItem("🎯 Risk Gauge"):
+                    risk_gauge_plot = gr.Plot(label="Risk Score")
+    
+    # ── Tables ─────────────────────────────────────────────────────────
+    gr.Markdown("---")
+    with gr.Row():
+        with gr.Column():
+            gr.Markdown("### ⚠️ Bottleneck Alerts")
+            bottleneck_table = gr.Dataframe(
+                label="Detected Bottlenecks",
+                wrap=True,
+                interactive=False
+            )
+        
+        with gr.Column():
+            gr.Markdown("### 🔀 Rerouting Suggestions")
+            reroute_table = gr.Dataframe(
+                label="Alternative Routes",
+                wrap=True,
+                interactive=False
+            )
+    
+    # ── AI Safety Report ───────────────────────────────────────────────
+    gr.Markdown("---")
+    gr.Markdown("### 🤖 AI Safety Advisory Report")
+    gr.Markdown(
+        "*Generated by Mistral-7B-Instruct via HuggingFace Hub — "
+        "provides actionable recommendations based on simulation results*"
+    )
+    ai_report_output = gr.Markdown(
+        value="*AI report will appear here after simulation runs...*"
+    )
+    
+    # ── Examples ───────────────────────────────────────────────────────
+    gr.Markdown("---")
+    gr.Markdown("### 🎪 Quick Examples")
+    gr.Examples(
+        examples=[
+            ["Stadium", 2000, 90,  "Rush",      30],
+            ["Stadium", 500,  120, "Uniform",   30],
+            ["Festival", 3000, 180, "Staggered", 30],
+            ["Festival", 1000, 60,  "Rush",      20],
+        ],
+        inputs=[
+            venue_selector, crowd_size_slider, 
+            duration_slider, arrival_pattern, time_step
+        ],
+        label="Try these scenarios"
+    )
+    
+    # ── Event Handlers ─────────────────────────────────────────────────
+    
+    preview_btn.click(
+        fn=preview_venue,
+        inputs=[venue_selector],
+        outputs=[venue_map_plot]
+    )
+    
+    run_btn.click(
+        fn=run_full_simulation,
+        inputs=[
+            venue_selector,
+            crowd_size_slider,
+            duration_slider,
+            arrival_pattern,
+            time_step
+        ],
+        outputs=[
+            venue_map_plot,
+            occupancy_plot,
+            heatmap_plot,
+            risk_gauge_plot,
+            bottleneck_table,
+            reroute_table,
+            ai_report_output,
+            summary_text
+        ]
+    )
+    
+    # Auto-preview on venue change
+    venue_selector.change(
+        fn=preview_venue,
+        inputs=[venue_selector],
+        outputs=[venue_map_plot]
+    )
+
+if __name__ == "__main__":
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False,
+        show_error=True
+    )
